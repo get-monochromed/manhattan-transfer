@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;
+Actions=SendFiles;
+X-KDE-Priority=TopLevel
+Name=Send with Manhattan Transfer
+
+[Desktop Action SendFiles]
+Name=Send with Manhattan Transfer
+Icon=document-share
+Exec=nearby-transfer -- %F

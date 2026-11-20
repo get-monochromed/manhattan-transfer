@@ -1,0 +1,5 @@
+# Cargo and CMake builds
+/target/
+/.build/
+/desktop-build/
+/dist/

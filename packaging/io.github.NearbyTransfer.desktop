@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Manhattan Transfer
+Comment=Send and receive files with Quick Share and LocalSend
+Exec=nearby-transfer -- %F
+Icon=document-share
+Terminal=false
+Categories=Network;FileTransfer;Qt;KDE;
+StartupNotify=true

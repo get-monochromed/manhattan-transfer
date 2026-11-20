@@ -1,0 +1,323 @@
+# Third-party software
+
+KuickShare is GPL-3.0-or-later (see [LICENSE](LICENSE)). It builds on the projects below.
+
+## Origin
+
+| Project | License | Role |
+| --- | --- | --- |
+| [Packet](https://github.com/nozwock/packet) | GPL-3.0-or-later | KuickShare is derived from it |
+| [rquickshare / `rqs_lib`](https://github.com/nozwock/rquickshare) | GPL-3.0 | Quick Share protocol implementation, vendored as a path dependency in [`third_party/rqs_lib`](third_party/rqs_lib) (see below) |
+| [crQuickShare](https://github.com/wuruxu/crQuickShare) at `3aafd1f5` | BSD-3-Clause ([notice](third_party/rqs_lib/LICENSE-crQuickShare)) | Source of the interface-bound LAN connect, the fast and DCT advertisement parsers, the payload acks, the staged receive (`ReceiveBatch`) and the payload checks (`ValidatePayload`) ported into `rqs_lib` (rows marked crQuickShare below) |
+
+### Changes to `rqs_lib`
+
+`third_party/rqs_lib` is a modified copy of rquickshare `core_lib` at rev `c9ac93f5584a4265e8da679ad689df5be1e80c6b`. Changes against that revision:
+
+| Change | Files |
+| --- | --- |
+| WIFI_HOTSPOT and WIFI_DIRECT bandwidth upgrade in both directions, plain frames when the host disables encryption, and the half-read frame state of the sender reset at the socket swap, as the receiver's is (new) | `src/upgrade.rs`, `src/upgrade/tests.rs`; handlers in `src/hdl/inbound.rs`, `src/hdl/outbound.rs`; `src/lib.rs` (`set_wifi_link`) |
+| Prefer a same-network `WIFI_LAN` BLE reception upgrade when offered by the peer and possible (`WifiLink`: `lan_address`, `host_lan(ip, port)`, `close_lan`, `release`; a 10 s accept window, 3 wrong introductions end the offer); on any LAN failure offer the hotspot once, otherwise stay on BLE; same introduction/ACK/drain and transfer-stream handover | `src/upgrade.rs`, `src/upgrade/tests.rs`, `src/hdl/inbound.rs` |
+| Propagate the sender Wi-Fi adapter's 5 GHz support in `MediumMetadata` and pass the peer's 5 GHz support to the hotspot host (including the `ObserverLink::host` signature) | `src/upgrade.rs`, `src/upgrade/tests.rs`, `src/hdl/outbound.rs`, `src/hdl/inbound.rs`, `src/hdl/ble_send/dial.rs` |
+| Receive session over a non-TCP stream, cancel-safe length prefix, keep-alive tolerance in the handshake | `src/hdl/migratable.rs` (new), `src/hdl/inbound.rs`, `src/hdl/outbound.rs`, `src/utils.rs`, `src/manager.rs` |
+| Bluetooth receiver (new) | `src/hdl/ble_receiver/`, `src/hdl/mod.rs`, `src/lib.rs` |
+| Bluetooth sender: windowed scan, L2CAP dial and bridge, BLE endpoints in `EndpointInfo` and `SendInfo` (new) | `src/hdl/ble_scan.rs`, `src/hdl/ble_send/`, `src/lib.rs`, `src/manager.rs`, `src/hdl/mdns_discovery.rs` |
+| If the L2CAP dial fails before sending any data, fall back to GATT only if a whole GATT dial plus a 2 s first-frame reserve fits in the BLE start budget (L2CAP gets min(15 s, remaining - 2 s)); never retry after a stream send starts; `BLE_START_BUDGET` is re-exported for the daemon's watchdog; tokio `test-util` for the paused-time tests | `src/hdl/ble_scan.rs`, `src/lib.rs`, `Cargo.toml` |
+| Advertise a 17-byte Nearby legacy BLE header (byte 0 `0x41`, version 2 only established) when BlueZ reports a capacity too small for the full receiver record, or after an `InvalidArguments` refusal when the capacity is unknown; scan such headers via GATT slot-0 reads (during a send only, at most 2 per window, once per address, bounded by min(7 s, time left)) and parse the full record | `src/hdl/ble_receiver/advertiser.rs`, `src/hdl/ble_receiver/service_data.rs`, `src/hdl/ble_receiver/gatt.rs` (`SLOT0_UUID` is `pub(crate)`), `src/hdl/ble_scan.rs` |
+| `DisconnectOnDrop` and `disconnect` shared by the GATT dial and the slot-0 read, so a dropped read closes its connection (moved from `ble_send/gatt_dial.rs`) | `src/hdl/ble_disconnect.rs` (new), `src/hdl/mod.rs`, `src/hdl/ble_send/gatt_dial.rs`, `src/hdl/ble_scan.rs` |
+| BLE scanner removed (`src/hdl/ble.rs`, `btleplug`); periodic mDNS re-announce instead | `src/hdl/mdns.rs`, `src/lib.rs`, `Cargo.toml` |
+| The `MDnsServer` task logs its error instead of dropping it | `src/lib.rs` |
+| Four fixes:<br>- mDNS ignores the hotspot subnet<br>- a send reads the phone's cancel or disconnection while it writes<br>- a phone known to advertise no PSM is dialled over GATT at once<br>- a pending BLE connect is cancelled when a dial ends | `src/hdl/mdns.rs`, `src/hdl/mdns_discovery.rs`, `src/hdl/outbound.rs`, `src/utils.rs`, `src/hdl/ble_scan.rs`, `src/hdl/ble_send/` |
+| Received file names: only the last path component is kept (a peer cannot write outside the download directory), and a missing or generic (`.tmp`, `.bin`) extension is taken from the `mime_type` when unambiguous | `src/utils.rs` (`received_file_name`), `src/hdl/inbound.rs` |
+| Inbound files are staged and never overwrite one another (after crQuickShare `ReceiveBatch`): at accept time (never at the offer) the session makes a hidden folder `.kuickshare-incoming-<16 hex>` (mode 0700, `mkdirat`, then `openat(O_DIRECTORY\|O_NOFOLLOW)`, a non-blocking exclusive `flock` and a check that the name still leads to the opened folder, up to 4 tries) inside the download directory opened at the offer (refused if that directory was replaced; inside it, so the final rename never crosses a file system), and reserves each file there with `openat(O_CREAT\|O_EXCL\|O_NOFOLLOW)` under its real name (`name`, then `stem (N).ext` numbered from the original name, 255-byte limit kept, also after the MIME extension is added; a name the file system refuses fails at accept); a file is opened for writing only while its data arrives, at most one at a time, opened non-blocking and checked to be a regular file that is the reserved inode (or, where inode numbers are not stable, a regular file on the same device with the size written so far); a complete, synced file is published with `renameat2(RENAME_NOREPLACE)` as `name` or the first free `stem (N).ext` (where the kernel or file system lacks the flag: an exclusive create of the target, then a rename over it), and the download directory is synced before the payload ack; a partial file never has its final name; the hidden folder goes with the last file of the session; a folder named exactly the prefix and 16 hex digits, with no live `flock` and nothing in it changed for an hour (`STALE_AFTER`: a lock reaches neither another machine nor a file system without `flock`, where only the age tells), loses the files directly in it (never following symlinks; a subfolder stays) and then itself, at the next accept into that directory or at an offer that does not fit the free space; a `flock` error other than "held" leaves the session's folder unlocked; the final name announced at the accept is tried first when a file is published, so files of one name that complete out of order keep their announced paths; `saved_paths` holds the planned final names from the accept and the real path of each file once it is published, before its ack and before `Finished` | `src/safety.rs` (new, `DestDir`, `Staging`, `Partial`), `src/hdl/inbound.rs` (`accept_transfer`, `finish_file`), `src/hdl/info.rs` (`InboundFiles`), `src/hdl/mod.rs`, `src/utils.rs` |
+| Inbound file safety: an offer is checked before the user is asked (`check_offer`: at most 10,000 files, no negative or overflowing sizes, no duplicate payload ids, no control or invisible characters in names (the joiners U+200C and U+200D are allowed), enough free space, a usable download folder; refused with `UnsupportedAttachmentType` or `NotEnoughSpace` and `TransferMetadata::refusal`; the offer does not create the folder); `Finished` only when every file has the declared size and was synced; a file not finished is removed on cancel, decline, error, EOF, timeout or panic; file data and text are refused before the accept; a second accept is ignored; `Bytes` payloads are bounded by the size their first chunk declared (5 MiB, 1 open before the accept, 4 after; a later chunk with another total is refused), negative sizes are refused and a last chunk before the declared size is an error; a FILE chunk with data whose header total differs from the offered size is refused (the empty last chunk is not held to it), and so is a `Bytes` payload with the id of an offered file (after crQuickShare `ValidatePayload`; never tried with a phone); frame bodies are read without allocating the announced length | `src/safety.rs` (new), `src/hdl/inbound.rs`, `src/hdl/outbound.rs` (Bytes assembler), `src/hdl/info.rs`, `src/hdl/mod.rs`, `src/lib.rs`, `Cargo.toml` (`rustix` with `fs`), `Cargo.lock` |
+| Inbound sessions have limits: 90 s handshake, 60 s without bytes (not while the user is asked, not during a Wi-Fi upgrade), a deadline for each frame body (the bus is served while it is read, so decline and cancel are not held up), a deadline on every frame write of the session (a stream whose write failed is not written again), a 330 s ceiling on the wait for the user (the library then declines; the core's own timer is 300 s), at most 32 LAN sessions and 4 per address, and an `accept()` error is retried with a back-off instead of ending the server loop; the limits and the listener are injectable for tests; a reject frame is followed by a shutdown and a short wait for the peer | `src/manager.rs`, `src/hdl/inbound.rs`, `src/upgrade.rs` (`UpgradeState::in_progress`) |
+| The inbound and outbound sessions log no PIN, sender name, file name or path, text or SSID above `debug` (frames are logged by type only); `OutboundPayload` has a hand-written `Debug` that shows only counts and lengths. Other modules (mDNS, BLE) were not reviewed for this | `src/hdl/inbound.rs`, `src/hdl/outbound.rs`, `src/manager.rs` |
+| The receiver advertisement asks for the 1M secondary PHY (extended PDU), as its service data exceeds a legacy PDU (the failure without it is taken from upstream, *(inferred)*, not reproduced) | `src/hdl/ble_receiver/advertiser.rs` |
+| `TransferMetadata::saved_paths`: where an inbound file is saved | `src/hdl/info.rs`, `src/hdl/inbound.rs`, `src/hdl/outbound.rs` |
+| Wi-Fi credentials payload decoded as a `WifiCredentials` protobuf (password in field 1; the optional `hidden_ssid` in field 2), instead of assuming a trailing `hidden_ssid`; `SAE = 4` added to `WifiCredentialsMetadata.SecurityType` and WPA3-SAE accepted | `src/hdl/inbound.rs`, `src/proto_src/wire_format.proto` |
+| `TransferPayload` has a hand-written `Debug` that redacts a Wi-Fi password, and the errors of the Wi-Fi payload parser no longer quote the raw buffer (it holds the password) | `src/hdl/info.rs`, `src/hdl/inbound.rs` |
+| Per-chunk logs lowered to `trace` | `src/hdl/inbound.rs`, `src/hdl/outbound.rs` |
+| `sys_metrics` (AGPL-3.0) replaced by reading `/proc/sys/kernel/hostname`; `get_if_addrs` replaced by `if-addrs` | `src/utils.rs`, `src/lib.rs`, `Cargo.toml` |
+| `mdns-sd` from crates.io (0.22), and `if-addrs` 0.15 to match it, instead of the `unsolicited` branch of a fork: the periodic announcement is a second `register` call, the advertised addresses are IPv4 only through `disable_interface(IfKind::IPv6)` on the advertising daemon, probing is off (`set_requires_probe(false)`), and the host name carries the `.local.` suffix it requires | `Cargo.toml`, `src/hdl/mdns.rs` |
+| Dependencies trimmed: `serde` dropped (unused), `bluer` built with only the `bluetoothd` and `l2cap` features, `directories` replaced by `dirs` (as in the core). The aarch64-only `dbus` dependency with `vendored` stays: it only makes libdbus build from source for bluer there *(inferred: upstream gives no reason)* | `Cargo.toml`, `src/utils.rs` |
+| `license = "GPL-3.0-only"` added to the manifest (upstream declares none, cargo-deny warned) | `Cargo.toml` |
+| Inbound sessions end with the service: `InboundRequest::with_stop` takes the service's cancellation token; when it is cancelled the session ends like a user cancel (the app gets `Cancelled`, the peer gets the sharing Cancel and the Disconnection if a frame can still be written, within 400 ms; a session the app does not know yet, or a stream whose write failed, is simply dropped; partial files are removed; the stop is checked before each `select!` of `handle` and each read step of a frame body, because `select!` picks at random among ready branches and a queued bus message could win). `TcpServer::run` keeps its sessions and sends in a task tracker and waits for them at most 400 ms (`STOP_WIND_DOWN`, public: the core's stop bound is asserted to be above it) after the cancel; the Bluetooth receiver passes the service token (not its own advertising `stop`, which lets a transfer in flight finish) and a tracker to the GATT sessions and waits for them the same way; the reachability probe of a resolved mDNS service (up to 3 s) ends when the service is cancelled | `src/manager.rs`, `src/hdl/inbound.rs`, `src/hdl/ble_receiver/gatt.rs`, `src/hdl/ble_receiver/mod.rs`, `src/hdl/mdns_discovery.rs` |
+| The receiver advertisement parser checks every index (no slicing that relies on an earlier check) and has a seeded randomized test (100,000 random strings, 50,000 mutations of valid advertisements, 5,000 round trips) | `src/hdl/ble_receiver/service_data.rs` |
+| A local file whose name is not UTF-8 fails the send with an error instead of panicking the send task (`utf8_file_name`) | `src/hdl/outbound.rs` |
+| The mDNS `n` record and the BLE receiver advertisement carry the same endpoint info (`gen_endpoint_info`: version 1, one 16-byte identity drawn once per start, the name cut at 100 bytes), so a phone merges the two mediums of the computer and picks the LAN; upstream drew a new random identity for every mDNS record | `src/utils.rs`, `src/hdl/mdns.rs`, `src/lib.rs`, `src/hdl/ble_receiver/service_data.rs` |
+| A text or link received over BLE gets its `WIFI_LAN` upgrade offered as soon as the offer arrives, before the user consents, because its payload follows the accept at once; a failed early LAN offer is not followed by a hotspot (`UpgradeState::set_lan_only`); the peer's mediums and the upgrade choice are logged at `info` | `src/hdl/inbound.rs`, `src/upgrade.rs` |
+| Interface-bound LAN connects (`net::lan_connect`, public: the core's route probe uses it too): a send and the mDNS reachability probe to an IPv4 peer use the interface that is up, not point-to-point (tunnels never win) and whose subnet contains the peer, preferring a physical one (a backing device under `/sys/class/net`) over a bridge, bond or VLAN on the same subnet; it is pinned with `SO_BINDTODEVICE` (the device of an alias label such as `eth0:1`; unprivileged since Linux 5.7) and its address bound as the source; a peer that no interface holds (a routed subnet), an IPv6 or a loopback peer, or a refused socket option or bind, takes the plain connect as before; the log names the interface, never an address (after crQuickShare `ConnectTcpChannel`, whose `IP_UNICAST_IF` Linux TCP ignores and which refuses routed peers instead) | `src/net.rs` (new), `src/lib.rs`, `src/manager.rs`, `src/hdl/mdns_discovery.rs`, `Cargo.toml` (`libc`), `Cargo.lock` |
+| The receiver advertisement parser also reads the fast `0x4a` form (1-byte length, no service hash, no classic Bluetooth address, an optional UWB address after the endpoint info) and the DCT `0x20` form (data elements: Sharing hash `6d fd`, PSM, a 1–7 byte device name without control characters; any order, unknown types skipped, a repeated type or more than 32 elements refused); a DCT result has no endpoint id and takes bytes 2..6 of the BLE address as one, so it changes when the address rotates; `ParseError::FastForm` is gone. Tested on hand-built bytes only: no captured phone advertisement in either form (port of crQuickShare `advertisement_codec.cc`) | `src/hdl/ble_receiver/service_data.rs`, `src/hdl/ble_scan.rs` |
+| `PAYLOAD_ACK`: both sides answer the connection at safe-to-disconnect level 6 (`safe_to_disconnect_version`, field 7 of `ConnectionResponseFrame`, and `PAYLOAD_ACK = 3` added to the proto) and read the peer's level; with a peer at 6 or more the receiver sends one ack per completed FILE payload (a failed ack fails the transfer, except the last one, which is only logged) and the sender reports `Finished` only once every sent file is acknowledged (acks read while later files are written are taken at once, not queued): a disconnect, a Disconnection frame, a CONTROL frame for an owed file, or no acks within 60 s of the last chunk (`ACK_WAIT`, keep-alives do not extend it) fails the send. Level 6 includes the levels below it (the chunk index and the safe-to-disconnect close, next rows); auto-reconnect and auto-resume themselves (levels 3 to 5) are not implemented. Bytes payloads are not acked, as crQuickShare does *(inferred: the Android side is not open)*. With a Pixel 7, which declares level 4 and so sends no acks: the chunk index and the handshake; the acks themselves never ran with a phone (after crQuickShare `AckFile` and `SupportsAck`) | `src/proto_src/offline_wire_formats.proto`, `src/hdl/inbound.rs`, `src/hdl/outbound.rs`, `src/hdl/mod.rs` (`InnerState::peer_disconnect_version`), `src/upgrade.rs` |
+| Every outgoing chunk carries its `index` (0, 1, … per file, the last-chunk marker included; 0 and 1 for a Bytes payload; `index = 4` added to `PayloadChunk`), which a peer at safe-to-disconnect level 4 (auto-resume) requires: a Pixel 7 at level 4 logged `duplicated payload chunk at index = 0 <= 0 for FILE, reject` for every chunk after the first and kept 512 KiB of each file we sent (hand test) | `src/proto_src/offline_wire_formats.proto`, `src/hdl/inbound.rs`, `src/hdl/outbound.rs` |
+| With a peer at safe-to-disconnect level 1 or more both sides close with the handshake: our Disconnection carries `request_safe_to_disconnect`, and the peer's ack is awaited before the FIN (a request of its own that crosses ours is answered with both flags set, as upstream's `EndpointManager` does, and the ack to ours is still read, or it stays unread at a BLE bridge that waits 5 s to hand it over) within the close's own bound (2 s, `CANCEL_TIMEOUT`; inside the 300 ms of a service stop), and after a finished send the peer's ack ends the session. Not when the close sends no request (a decline, a refusal), nor after a cancel that cut a frame in the middle (nothing can be read or written as a frame then). The prior channel's Disconnection after an upgrade keeps both flags false, because a request there makes an upstream peer remove the whole endpoint. Without the handshake a Pixel 7 at level 4 logged `[unsafe disconnection] IO_ERROR` at every end and tried to reconnect, for 5.6 s after its own cancel; with it, `[safe disconnection]` and its cancel shown 0.4 s after the tap (hand test) | `src/hdl/inbound.rs`, `src/hdl/outbound.rs`, `src/upgrade.rs` |
+| A sender's sharing Response that comes before its Introduction is ignored instead of ending the session: a Pixel 7 writes both payloads at once, so their order varies | `src/hdl/inbound.rs` |
+| Formatting only (and an unused test import) | `src/hdl/mdns_discovery.rs`, `src/hdl/blea.rs` (comment), `src/hdl/outbound.rs`, `src/hdl/ble_scan.rs`, `src/hdl/ble_send/gatt_dial.rs`, `src/manager.rs` |
+
+## System software and bundled libraries
+
+These are used from the host by the tarball installer (it checks that they are present) and by the Flatpak's runtime-less parts. The Flatpak uses the KDE runtime instead.
+
+The **AppImage ships them**, so their licenses apply to that file too:
+
+- It bundles Qt 6, KDE Frameworks 6, Kirigami, the Plasma platform theme, the Breeze icons, glibc and the other libraries the two binaries load.
+- They are built from Arch Linux packages by `quick-sharun`, see [`build/build-appimage.sh`](build/build-appimage.sh).
+- Most are LGPL, which allows relinking: the libraries are separate files inside the AppImage and can be replaced after `--appimage-extract`.
+- The full list of bundled files is `find squashfs-root` after extracting.
+
+| Software | License |
+| --- | --- |
+| Qt 6 (Base, Declarative, SVG) | LGPL-3.0 (modules also available under GPL) |
+| KDE Frameworks 6 (KI18n, KConfig, KCoreAddons, KDBusAddons, KIO, KIconThemes) | mostly LGPL-2.0-or-later / LGPL-2.1-or-later; see each framework |
+| Kirigami | LGPL-2.0-or-later |
+| kirigami-addons | LGPL-2.0-or-later (some parts GPL/MIT; unverified per file) |
+| Breeze icon theme | LGPL-3.0-or-later |
+
+Icons are referenced by theme name and resolved from the system Breeze theme at run time; none are copied into this repository except KuickShare's own app icon.
+
+## Rust crates
+
+The tarball (the host-library package) contains only the two binaries `kuickshare` and `kuickshared` (see [`build/build-host-payload.sh`](build/build-host-payload.sh)). All crates below are statically linked into `kuickshared`.
+
+The list is generated from `cargo metadata` (`Cargo.lock`), restricted to normal (non-dev, non-build-only) dependencies reachable from `kuickshare-core`, and covers all target platforms, so a few entries may not be compiled on Linux. Licenses are the SPDX expressions declared by each crate.
+
+### Direct dependencies
+
+| Crate | Version | License |
+| --- | --- | --- |
+| anyhow | 1.0.104 | MIT OR Apache-2.0 |
+| dirs | 7.0.0 | MIT OR Apache-2.0 |
+| futures-util | 0.3.34 | MIT OR Apache-2.0 |
+| hex | 0.4.3 | MIT OR Apache-2.0 |
+| rand | 0.10.3 | MIT OR Apache-2.0 |
+| rqs_lib | 0.11.5 | GPL-3.0-only |
+| serde | 1.0.229 | MIT OR Apache-2.0 |
+| serde_json | 1.0.154 | MIT OR Apache-2.0 |
+| sha2 | 0.11.1 | MIT OR Apache-2.0 |
+| snow | 0.10.0 | Apache-2.0 OR MIT |
+| tokio | 1.54.0 | MIT |
+| tracing | 0.1.44 | MIT |
+| tracing-subscriber | 0.3.23 | MIT |
+| zbus | 6.0.0 | MIT |
+
+### Transitive dependencies
+
+<details>
+<summary>223 crates</summary>
+
+| Crate | Version | License |
+| --- | --- | --- |
+| aead | 0.5.2 | MIT OR Apache-2.0 |
+| aes | 0.8.4 | MIT OR Apache-2.0 |
+| aes-gcm | 0.10.3 | Apache-2.0 OR MIT |
+| aho-corasick | 1.1.5 | Unlicense OR MIT |
+| async-trait | 0.1.92 | MIT OR Apache-2.0 |
+| base16ct | 0.2.0 | Apache-2.0 OR MIT |
+| base64 | 0.22.1 | MIT OR Apache-2.0 |
+| base64ct | 1.8.3 | Apache-2.0 OR MIT |
+| bitflags | 1.3.2 | MIT/Apache-2.0 |
+| bitflags | 2.13.2 | MIT OR Apache-2.0 |
+| blake2 | 0.10.6 | MIT OR Apache-2.0 |
+| block-buffer | 0.10.4 | MIT OR Apache-2.0 |
+| block-buffer | 0.12.1 | MIT OR Apache-2.0 |
+| bluer | 0.17.4 | BSD-2-Clause |
+| bumpalo | 3.20.3 | MIT OR Apache-2.0 |
+| bytes | 1.12.1 | MIT |
+| cfg-if | 1.0.5 | MIT OR Apache-2.0 |
+| chacha20 | 0.9.1 | Apache-2.0 OR MIT |
+| chacha20poly1305 | 0.10.1 | Apache-2.0 OR MIT |
+| cipher | 0.4.4 | MIT OR Apache-2.0 |
+| concurrent-queue | 2.5.0 | Apache-2.0 OR MIT |
+| const-oid | 0.10.2 | Apache-2.0 OR MIT |
+| const-oid | 0.9.6 | Apache-2.0 OR MIT |
+| cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
+| cpufeatures | 0.3.1 | MIT OR Apache-2.0 |
+| crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 |
+| crypto-bigint | 0.5.5 | Apache-2.0 OR MIT |
+| crypto-common | 0.1.7 | MIT OR Apache-2.0 |
+| crypto-common | 0.2.2 | MIT OR Apache-2.0 |
+| ctr | 0.9.2 | MIT OR Apache-2.0 |
+| curve25519-dalek | 4.1.3 | BSD-3-Clause |
+| curve25519-dalek-derive | 0.1.1 | MIT/Apache-2.0 |
+| custom_debug | 0.6.2 | Apache-2.0 OR MIT |
+| custom_debug_derive | 0.6.2 | Apache-2.0 OR MIT |
+| darling | 0.20.11 | MIT |
+| darling_core | 0.20.11 | MIT |
+| darling_macro | 0.20.11 | MIT |
+| dbus | 0.9.12 | Apache-2.0/MIT |
+| dbus-crossroads | 0.5.3 | Apache-2.0/MIT |
+| dbus-tokio | 0.7.6 | Apache-2.0/MIT |
+| der | 0.7.10 | Apache-2.0 OR MIT |
+| digest | 0.10.7 | MIT OR Apache-2.0 |
+| digest | 0.11.3 | MIT OR Apache-2.0 |
+| dirs-sys | 0.5.0 | MIT OR Apache-2.0 |
+| displaydoc | 0.2.7 | MIT OR Apache-2.0 |
+| ecdsa | 0.16.9 | Apache-2.0 OR MIT |
+| either | 1.19.0 | MIT OR Apache-2.0 |
+| elliptic-curve | 0.13.8 | Apache-2.0 OR MIT |
+| endi | 1.1.1 | MIT |
+| errno | 0.3.14 | MIT OR Apache-2.0 |
+| fastrand | 2.5.0 | Apache-2.0 OR MIT |
+| ff | 0.13.1 | MIT/Apache-2.0 |
+| fiat-crypto | 0.2.9 | MIT OR Apache-2.0 OR BSD-1-Clause |
+| flume | 0.11.1 | Apache-2.0/MIT |
+| fnv | 1.0.7 | Apache-2.0 / MIT |
+| futures | 0.3.34 | MIT OR Apache-2.0 |
+| futures-channel | 0.3.34 | MIT OR Apache-2.0 |
+| futures-core | 0.3.34 | MIT OR Apache-2.0 |
+| futures-executor | 0.3.34 | MIT OR Apache-2.0 |
+| futures-io | 0.3.34 | MIT OR Apache-2.0 |
+| futures-macro | 0.3.34 | MIT OR Apache-2.0 |
+| futures-sink | 0.3.34 | MIT OR Apache-2.0 |
+| futures-task | 0.3.34 | MIT OR Apache-2.0 |
+| generic-array | 0.14.7 | MIT |
+| getrandom | 0.2.17 | MIT OR Apache-2.0 |
+| getrandom | 0.3.4 | MIT OR Apache-2.0 |
+| getrandom | 0.4.3 | MIT OR Apache-2.0 |
+| ghash | 0.5.1 | Apache-2.0 OR MIT |
+| group | 0.13.0 | MIT/Apache-2.0 |
+| heck | 0.5.0 | MIT OR Apache-2.0 |
+| hkdf | 0.12.4 | MIT OR Apache-2.0 |
+| hmac | 0.12.1 | MIT OR Apache-2.0 |
+| hybrid-array | 0.4.15 | MIT OR Apache-2.0 |
+| ident_case | 1.0.1 | MIT/Apache-2.0 |
+| if-addrs | 0.15.0 | MIT OR BSD-3-Clause |
+| inout | 0.1.4 | MIT OR Apache-2.0 |
+| itertools | 0.14.0 | MIT OR Apache-2.0 |
+| itoa | 1.0.18 | MIT OR Apache-2.0 |
+| js-sys | 0.3.106 | MIT OR Apache-2.0 |
+| lazy_static | 1.5.1 | MIT OR Apache-2.0 |
+| libaes | 0.7.0 | Apache-2.0 OR MIT |
+| libc | 0.2.191 | MIT OR Apache-2.0 |
+| libdbus-sys | 0.2.7 | Apache-2.0/MIT |
+| libredox | 0.1.25 | MIT |
+| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| lock_api | 0.4.14 | MIT OR Apache-2.0 |
+| log | 0.4.34 | MIT OR Apache-2.0 |
+| macaddr | 1.0.1 | Apache-2.0 OR MIT |
+| matchers | 0.2.0 | MIT |
+| mdns-sd | 0.22.0 | Apache-2.0 OR MIT |
+| memchr | 2.8.3 | Unlicense OR MIT |
+| memoffset | 0.9.1 | MIT |
+| mime | 0.3.17 | MIT OR Apache-2.0 |
+| mime_guess | 2.0.5 | MIT |
+| mio | 1.2.4 | MIT |
+| nix | 0.29.0 | MIT |
+| nu-ansi-term | 0.50.3 | MIT |
+| num-bigint | 0.4.8 | MIT OR Apache-2.0 |
+| num-derive | 0.4.2 | MIT OR Apache-2.0 |
+| num-integer | 0.1.47 | MIT OR Apache-2.0 |
+| num-traits | 0.2.19 | MIT OR Apache-2.0 |
+| once_cell | 1.21.4 | MIT OR Apache-2.0 |
+| opaque-debug | 0.3.1 | MIT OR Apache-2.0 |
+| option-ext | 0.2.0 | MPL-2.0 |
+| ordered-stream | 0.2.0 | MIT OR Apache-2.0 |
+| p256 | 0.13.2 | Apache-2.0 OR MIT |
+| pem-rfc7468 | 0.7.0 | Apache-2.0 OR MIT |
+| pin-project | 1.1.13 | Apache-2.0 OR MIT |
+| pin-project-internal | 1.1.13 | Apache-2.0 OR MIT |
+| pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
+| pkcs8 | 0.10.2 | Apache-2.0 OR MIT |
+| polling | 2.8.0 | Apache-2.0 OR MIT |
+| poly1305 | 0.8.0 | Apache-2.0 OR MIT |
+| polyval | 0.6.2 | Apache-2.0 OR MIT |
+| ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
+| primeorder | 0.13.6 | Apache-2.0 OR MIT |
+| proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
+| prost | 0.13.5 | Apache-2.0 |
+| prost-derive | 0.13.5 | Apache-2.0 |
+| quote | 1.0.47 | MIT OR Apache-2.0 |
+| r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
+| r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
+| rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
+| rand_core | 0.6.4 | MIT OR Apache-2.0 |
+| rand_core | 0.9.5 | MIT OR Apache-2.0 |
+| redox_users | 0.5.3 | MIT |
+| regex-automata | 0.4.18 | MIT OR Apache-2.0 |
+| regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
+| rfc6979 | 0.4.0 | Apache-2.0 OR MIT |
+| ring | 0.17.14 | Apache-2.0 AND ISC |
+| rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| rustversion | 1.0.23 | MIT OR Apache-2.0 |
+| scopeguard | 1.2.0 | MIT OR Apache-2.0 |
+| sec1 | 0.7.3 | Apache-2.0 OR MIT |
+| serde_core | 1.0.229 | MIT OR Apache-2.0 |
+| serde_derive | 1.0.229 | MIT OR Apache-2.0 |
+| serde_repr | 0.1.21 | MIT OR Apache-2.0 |
+| sha2 | 0.10.9 | MIT OR Apache-2.0 |
+| sharded-slab | 0.1.7 | MIT |
+| signal-hook-registry | 1.4.8 | MIT OR Apache-2.0 |
+| signature | 2.2.0 | Apache-2.0 OR MIT |
+| slab | 0.4.12 | MIT |
+| smallvec | 1.16.3 | MIT OR Apache-2.0 |
+| socket2 | 0.4.10 | MIT OR Apache-2.0 |
+| socket2 | 0.6.5 | MIT OR Apache-2.0 |
+| spin | 0.9.9 | MIT |
+| spki | 0.7.3 | Apache-2.0 OR MIT |
+| strsim | 0.11.1 | MIT |
+| strum | 0.26.3 | MIT |
+| strum_macros | 0.26.4 | MIT |
+| subtle | 2.6.1 | BSD-3-Clause |
+| syn | 2.0.119 | MIT OR Apache-2.0 |
+| syn | 3.0.9 | MIT OR Apache-2.0 |
+| synstructure | 0.13.2 | MIT |
+| tempfile | 3.27.0 | MIT OR Apache-2.0 |
+| thiserror | 2.0.21 | MIT OR Apache-2.0 |
+| thiserror-impl | 2.0.21 | MIT OR Apache-2.0 |
+| thread_local | 1.1.10 | MIT OR Apache-2.0 |
+| tokio-macros | 2.7.2 | MIT |
+| tokio-stream | 0.1.19 | MIT |
+| tokio-util | 0.7.20 | MIT |
+| tracing-attributes | 0.1.31 | MIT |
+| tracing-core | 0.1.36 | MIT |
+| tracing-log | 0.2.0 | MIT |
+| typenum | 1.20.1 | MIT OR Apache-2.0 |
+| uds_windows | 1.2.1 | MIT |
+| unicase | 2.10.0 | MIT OR Apache-2.0 |
+| unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| universal-hash | 0.5.1 | MIT OR Apache-2.0 |
+| untrusted | 0.9.0 | ISC |
+| uuid | 1.28.0 | Apache-2.0 OR MIT |
+| valuable | 0.1.1 | MIT |
+| wasi | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| wasip2 | 1.0.4+wasi-0.2.12 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| wasm-bindgen | 0.2.129 | MIT OR Apache-2.0 |
+| wasm-bindgen-macro | 0.2.129 | MIT OR Apache-2.0 |
+| wasm-bindgen-macro-support | 0.2.129 | MIT OR Apache-2.0 |
+| wasm-bindgen-shared | 0.2.129 | MIT OR Apache-2.0 |
+| winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
+| winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
+| windows-link | 0.2.1 | MIT OR Apache-2.0 |
+| windows-sys | 0.48.0 | MIT OR Apache-2.0 |
+| windows-sys | 0.52.0 | MIT OR Apache-2.0 |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 |
+| windows-targets | 0.48.5 | MIT OR Apache-2.0 |
+| windows-targets | 0.52.6 | MIT OR Apache-2.0 |
+| windows_aarch64_gnullvm | 0.48.5 | MIT OR Apache-2.0 |
+| windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
+| windows_aarch64_msvc | 0.48.5 | MIT OR Apache-2.0 |
+| windows_aarch64_msvc | 0.52.6 | MIT OR Apache-2.0 |
+| windows_i686_gnu | 0.48.5 | MIT OR Apache-2.0 |
+| windows_i686_gnu | 0.52.6 | MIT OR Apache-2.0 |
+| windows_i686_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
+| windows_i686_msvc | 0.48.5 | MIT OR Apache-2.0 |
+| windows_i686_msvc | 0.52.6 | MIT OR Apache-2.0 |
+| windows_x86_64_gnu | 0.48.5 | MIT OR Apache-2.0 |
+| windows_x86_64_gnu | 0.52.6 | MIT OR Apache-2.0 |
+| windows_x86_64_gnullvm | 0.48.5 | MIT OR Apache-2.0 |
+| windows_x86_64_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
+| windows_x86_64_msvc | 0.48.5 | MIT OR Apache-2.0 |
+| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
+| winnow | 1.0.4 | MIT |
+| wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| zbus_macros | 6.0.0 | MIT |
+| zbus_utils | 6.0.0 | MIT |
+| zcheapstr | 1.1.0 | MIT |
+| zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT |
+| zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT |
+| zeroize | 1.9.1 | Apache-2.0 OR MIT |
+| zmij | 1.0.23 | MIT |
+| zruntime | 0.2.0 | MIT |
+
+</details>
